@@ -158,6 +158,10 @@ def clear_base():
     with locks["data"]:
         if state["c_tag"] in state["baselines"]:
             del state["baselines"][state["c_tag"]]
+            state["is_zeroed"] = False  # Tambahkan baris ini agar GUI langsung merespons
+            state["c_yaw"] = state["c_abs_yaw"]  # Kembalikan nilai Yaw ke asli
+            state["c_cx"] = state["c_raw_cx"]    # Kembalikan nilai X ke asli
+            state["c_cz"] = state["c_raw_cz"]    # Kembalikan nilai Y ke asli
     save_baselines()
 
 def toggle_headless():
