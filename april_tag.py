@@ -35,7 +35,8 @@ CFG = {
     "camera_frame": "rgb_optical_frame",
     
     # Physical camera offset compensation (meters)
-    "x_offset": -0.040,
+    "x_offset": -0.038,
+    "yaw_offset": -0.25,
     
     "display_width": 320,
     "display_height": 240,
@@ -43,13 +44,13 @@ CFG = {
     # ------------------------------------------------
     # PERFORMANCE & PRECISION SETTINGS
     # ------------------------------------------------
-    "processing_scale": 0.5,            # Low-res scale used ONLY for searching to save CPU
+    "processing_scale": 0.5,           # Keeps tag sharp during Search Mode
     "detection_interval_gui": 0.05,     # ~20 FPS interval when GUI is rendering
     "detection_interval_headless": 0.0, # Real-time processing (0ms delay) in Headless mode
     "gui_interval": 0.05,               # GUI update frequency
     "marker_size": 0.145,               # MUST match physical tag size exactly for precise distance
     "ema_alpha": 0.08,                  # Heavy filter for stable positional locking when still
-    "max_roi_misses": 5,                # Hysteresis buffer to prevent flicker (holds data for 5 frames)
+    "max_roi_misses": 5,                # Hysteresis buffer to prevent flicker
     
     "report_file": "aruco_accuracy_report.csv",
     "baseline_file": "aruco_registered_tags.csv",
@@ -72,6 +73,7 @@ state = {
     "roi_box": None,
     "roi_miss_count": 0,
     "last_good_corners": None,
+    "smoothed_corners": None,
     
     "locked_tag_id": None,
     "locked_tvec": None,
@@ -102,17 +104,21 @@ obj_pts = np.float32([
     [-CFG["marker_size"] / 2, -CFG["marker_size"] / 2, 0]
 ])
 
-# Optimized & Stabilized Detector Parameters
+# ====================================================
+# OPTIMIZED ARUCO PARAMETERS (Maximum Stability)
+# ====================================================
 aruco_params = cv2.aruco.DetectorParameters_create() if hasattr(cv2.aruco, "DetectorParameters_create") else cv2.aruco.DetectorParameters()
-aruco_params.polygonalApproxAccuracyRate = 0.04
-aruco_params.adaptiveThreshWinSizeMin = 5
-aruco_params.adaptiveThreshWinSizeMax = 15
-aruco_params.adaptiveThreshWinSizeStep = 15  # Cuts thresholding iterations in half!
 
-# Fall back to lightweight Subpixel refinement (Hysteresis will handle the jitter)
+aruco_params.polygonalApproxAccuracyRate = 0.04
+aruco_params.adaptiveThreshWinSizeMin = 3
+aruco_params.adaptiveThreshWinSizeMax = 23
+aruco_params.adaptiveThreshWinSizeStep = 8
+
+aruco_params.minMarkerPerimeterRate = 0.01
+
 aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-aruco_params.cornerRefinementWinSize = 4
-aruco_params.cornerRefinementMaxIterations = 15 # Caps the math loops to save CPU
+aruco_params.cornerRefinementWinSize = 5
+aruco_params.cornerRefinementMaxIterations = 10
 
 def get_aruco_dict(dict_enum):
     return cv2.aruco.Dictionary_get(dict_enum) if hasattr(cv2.aruco, "Dictionary_get") else cv2.aruco.getPredefinedDictionary(dict_enum)
@@ -158,10 +164,10 @@ def clear_base():
     with locks["data"]:
         if state["c_tag"] in state["baselines"]:
             del state["baselines"][state["c_tag"]]
-            state["is_zeroed"] = False  # Tambahkan baris ini agar GUI langsung merespons
-            state["c_yaw"] = state["c_abs_yaw"]  # return original yaw
-            state["c_cx"] = state["c_raw_cx"]    # return original x
-            state["c_cz"] = state["c_raw_cz"]    # return original y
+            state["is_zeroed"] = False
+            state["c_yaw"] = state["c_abs_yaw"]
+            state["c_cx"] = state["c_raw_cx"]
+            state["c_cz"] = state["c_raw_cz"]
     save_baselines()
 
 def toggle_headless():
@@ -250,22 +256,35 @@ def process_frame(gray_frame):
         # SNIPER MODE: Process high-res ROI
         x1, y1, x2, y2 = state["roi_box"]
         search_frame = gray_frame[y1:y2, x1:x2]
+        search_frame = cv2.GaussianBlur(search_frame, (5, 5), 0)
         offset_x, offset_y = x1, y1
         ran_full_res = True
         corners, ids, _ = cv2.aruco.detectMarkers(search_frame, adict, parameters=aruco_params)
+        
+        # INSTANT FALLBACK: If ROI fails, instantly search full screen
+        if ids is None or len(corners) == 0:
+            state["roi_box"] = None
+            offset_x, offset_y = 0, 0
+            ran_full_res = False
+            if proc_scale < 1.0:
+                search_frame = cv2.resize(gray_frame, (0, 0), fx=proc_scale, fy=proc_scale, interpolation=cv2.INTER_LINEAR)
+            else:
+                search_frame = gray_frame
+                ran_full_res = True
+            search_frame = cv2.GaussianBlur(search_frame, (5, 5), 0)
+            corners, ids, _ = cv2.aruco.detectMarkers(search_frame, adict, parameters=aruco_params)
     else:
-        # SEARCH MODE: Smooth linear downscaling
+        # SEARCH MODE
         if proc_scale < 1.0:
             search_frame = cv2.resize(gray_frame, (0, 0), fx=proc_scale, fy=proc_scale, interpolation=cv2.INTER_LINEAR)
         else:
             search_frame = gray_frame
             ran_full_res = True
-            
+        search_frame = cv2.GaussianBlur(search_frame, (5, 5), 0)
         corners, ids, _ = cv2.aruco.detectMarkers(search_frame, adict, parameters=aruco_params)
 
     # -------------------------------------------------------------
     # DATA HYSTERESIS (Memory Buffer)
-    # Default to carrying over the previous frame's data to prevent 1-frame flickering
     # -------------------------------------------------------------
     t_tag, t_dist, t_yaw, t_abs = state["c_tag"], state["c_dist"], state["c_yaw"], state["c_abs_yaw"]
     t_cx, t_cz = state["c_cx"], state["c_cz"]
@@ -276,7 +295,6 @@ def process_frame(gray_frame):
     if ids is not None and len(corners) > 0:
         state["roi_miss_count"] = 0
         
-        # Prevent tracker from jumping to background tags if multiple exist
         idx = 0
         t_id_found = False
         if state["locked_tag_id"] is not None:
@@ -298,30 +316,74 @@ def process_frame(gray_frame):
 
         selected_corners[:, 0] += offset_x
         selected_corners[:, 1] += offset_y
+        
+        # -------------------------------------------------------------
+        # 1. ABSOLUTE 2D CORNER FREEZE (Anti-Jitter)
+        # -------------------------------------------------------------
+        if state.get("smoothed_corners") is None or state["locked_tag_id"] != t_id:
+            state["smoothed_corners"] = selected_corners.copy()
+        else:
+            max_shift = np.max(np.abs(selected_corners - state["smoothed_corners"]))
+            
+            if max_shift < 3.0:
+                # SENSOR NOISE (< 3 px): Hard Freeze
+                selected_corners = state["smoothed_corners"].copy()
+            elif max_shift < 8.0:
+                # SLOW MOVEMENT (3 - 8 px): EMA Filter
+                alpha = 0.20
+                state["smoothed_corners"] = alpha * selected_corners + (1.0 - alpha) * state["smoothed_corners"]
+                selected_corners = state["smoothed_corners"].copy()
+            else:
+                # FAST MOVEMENT (> 8 px): Instant Follow
+                state["smoothed_corners"] = selected_corners.copy()
+
         detected_corners = selected_corners.astype(np.int32)
         state["last_good_corners"] = detected_corners
 
-        # Dynamic ROI Box with smart padding based on physical tag size in pixels
+        # -------------------------------------------------------------
+        # 2. EXTREME ROI DEADBAND (Freezes Blue Box)
+        # -------------------------------------------------------------
         tag_w = np.max(selected_corners[:, 0]) - np.min(selected_corners[:, 0])
         tag_h = np.max(selected_corners[:, 1]) - np.min(selected_corners[:, 1])
+        max_side = max(tag_w, tag_h)
+        uniform_pad = max(20, int(max_side * 0.2))
         
-        # Reduced padding to 30% of tag size, with a minimum of 30 pixels 
-        # so the box isn't too huge when the tag is far away.
-        pad_x = max(30, int(tag_w * 0.3))
-        pad_y = max(30, int(tag_h * 0.3))
+        min_x = max(0, int(np.min(selected_corners[:, 0])) - uniform_pad)
+        max_x = min(w_img, int(np.max(selected_corners[:, 0])) + uniform_pad)
+        min_y = max(0, int(np.min(selected_corners[:, 1])) - uniform_pad)
+        max_y = min(h_img, int(np.max(selected_corners[:, 1])) + uniform_pad)
         
-        min_x = max(0, int(np.min(selected_corners[:, 0])) - pad_x)
-        max_x = min(w_img, int(np.max(selected_corners[:, 0])) + pad_x)
-        min_y = max(0, int(np.min(selected_corners[:, 1])) - pad_y)
-        max_y = min(h_img, int(np.max(selected_corners[:, 1])) + pad_y)
+        new_roi = (min_x, min_y, max_x, max_y)
         
         if (max_x - min_x) > 20 and (max_y - min_y) > 20:
-            state["roi_box"] = (min_x, min_y, max_x, max_y)
+            if state["roi_box"] is None:
+                state["roi_box"] = new_roi
+            else:
+                c_x1, c_y1, c_x2, c_y2 = state["roi_box"]
+                if (abs(min_x - c_x1) > 15 or abs(min_y - c_y1) > 15 or
+                    abs(max_x - c_x2) > 15 or abs(max_y - c_y2) > 15):
+                    state["roi_box"] = new_roi
         else:
             state["roi_box"] = None
 
-        # Solve pose using intrinsic matrix K
-        success, rvec, tvec = cv2.solvePnP(obj_pts, selected_corners, state["K"], state["dist_coeffs"], flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        # -------------------------------------------------------------
+        # 3. POSE ESTIMATION & CONTINUITY (Resolves Pose Ambiguity Flips)
+        # -------------------------------------------------------------
+        if state["locked_rvec"] is not None and state["locked_tag_id"] == t_id:
+            # CONTINUOUS TRACKING: Feed the previous pose back into the solver.
+            success, rvec, tvec = cv2.solvePnP(
+                obj_pts, selected_corners, state["K"], state["dist_coeffs"],
+                rvec=state["locked_rvec"].copy(), 
+                tvec=state["locked_tvec"].copy(),
+                useExtrinsicGuess=True, 
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+        else:
+            # INITIAL LOCK
+            success, rvec, tvec = cv2.solvePnP(
+                obj_pts, selected_corners, state["K"], state["dist_coeffs"], 
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
 
         if success:
             if state["locked_tag_id"] != t_id or state["locked_tvec"] is None:
@@ -335,10 +397,18 @@ def process_frame(gray_frame):
                     (state["locked_tvec"][2][0] - tvec[2][0])**2
                 )
                 
-                if jump_distance > 0.05:
+                # ---------------------------------------------------------
+                # 4. 3D POSE DEADBAND (Freezes Distance/Telemetry)
+                # ---------------------------------------------------------
+                if jump_distance < 0.002:
+                    # MICRO-JITTER (< 2 mm): Freeze position!
+                    pass 
+                elif jump_distance > 0.05:
+                    # LARGE JUMP (> 5 cm): Instant transfer
                     state["locked_tvec"] = tvec.copy()
                     state["locked_rvec"] = rvec.copy()
                 else:
+                    # NORMAL MOVEMENT: Apply EMA Filter
                     dynamic_alpha = min(1.0, jump_distance * 20.0) 
                     alpha = max(CFG["ema_alpha"], dynamic_alpha)
                     
@@ -361,7 +431,18 @@ def process_frame(gray_frame):
 
             cx, cz = tx, tz
             raw_cx, raw_cz = cx, cz
+
+            # ---------------------------------------------------------
+            # UNIFIED STEERING HEADING (Smart Line-of-Sight)
+            # Combines both shifting and rotating into 1 robust angle.
+            # Shifting/Rotating Left -> Tag goes Right -> Positive (+)
+            # Shifting/Rotating Right -> Tag goes Left -> Negative (-)
+            # ---------------------------------------------------------
             raw_yaw = math.degrees(math.atan2(cx, cz))
+
+            # ZERO DEADBAND: Locks noise near zero to prevent sign flickering
+            if abs(raw_yaw) < 0.5:
+                raw_yaw = 0.0
 
             if t_id in state["baselines"]:
                 z_flag = True
@@ -373,18 +454,21 @@ def process_frame(gray_frame):
             t_cx = -(cx - b_x) if z_flag else -cx
             t_cz = -(cz - b_z) if z_flag else cz
 
-            t_yaw = (t_abs - b_yaw + 180.0) % 360.0 - 180.0
+            # Calculate final relative heading (Keeps the + / - sign natively intact)
+            t_yaw = (t_abs - b_yaw + CFG["yaw_offset"] + 180.0) % 360.0 - 180.0            
+            t_yaw = -1 * t_yaw  # Invert yaw to match robot's coordinate system
+
             t_dist = cz if abs(cx) <= 0.2 else math.sqrt(cx * cx + cz * cz)
             t_tag = state["locked_tag_id"]
     else:
         state["roi_miss_count"] += 1
         if state["roi_miss_count"] >= CFG["max_roi_misses"]:
-            # TRULY LOST: The tag has been gone for >5 frames. Reset everything.
             state["roi_box"] = None
             state["locked_tag_id"] = None
             state["locked_tvec"] = None
             state["locked_rvec"] = None
             state["last_good_corners"] = None
+            state["smoothed_corners"] = None
             t_tag, t_dist, t_yaw, t_abs, t_cx, t_cz = None, 0.0, 0.0, 0.0, 0.0, 0.0
             z_flag, raw_cx, raw_cz = False, 0.0, 0.0
             detected_corners = None
